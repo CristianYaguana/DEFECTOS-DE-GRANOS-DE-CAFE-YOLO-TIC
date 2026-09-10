@@ -7,7 +7,6 @@ class Detection {
   final double y1;
   final double x2;
   final double y2;
-  final List<Offset> mask;
 
   const Detection({
     required this.label,
@@ -16,7 +15,6 @@ class Detection {
     required this.y1,
     required this.x2,
     required this.y2,
-    required this.mask,
   });
 
   static const List<String> classNames = [
@@ -35,29 +33,15 @@ class Detection {
     return x2 > x1 && y2 > y1;
   }
 
-  bool get hasValidMask {
-    return mask.length >= 3;
-  }
-
   bool get isBoxNormalized {
     return x1 >= 0 &&
         y1 >= 0 &&
         x2 <= 1 &&
         y2 <= 1 &&
         x2 > x1 &&
-        y2 > y1;
-  }
-
-  bool get isMaskNormalized {
-    if (mask.isEmpty) return false;
-
-    return mask.every(
-          (point) =>
-      point.dx >= 0 &&
-          point.dx <= 1 &&
-          point.dy >= 0 &&
-          point.dy <= 1,
-    );
+        y2 > y1 &&
+        (x2 - x1) <= 1.0 &&
+        (y2 - y1) <= 1.0;
   }
 
   String get displayLabel {
@@ -66,12 +50,15 @@ class Detection {
         .split(' ')
         .map((word) {
       if (word.isEmpty) return word;
-      return word[0].toUpperCase() + word.substring(1);
+
+      return word[0].toUpperCase() +
+          word.substring(1);
     })
         .join(' ');
   }
 
-  factory Detection.fromJson(Map<String, dynamic> json) {
+  factory Detection.fromJson(
+      Map<String, dynamic> json) {
     final label = _parseLabel(json);
 
     final confidence = _toDouble(
@@ -90,16 +77,6 @@ class Detection {
           json,
     );
 
-    final mask = _parseMask(
-      json['mask'] ??
-          json['polygon'] ??
-          json['segmentation'] ??
-          json['segments'] ??
-          json['points'] ??
-          json['contour'] ??
-          json['mask_points'],
-    );
-
     return Detection(
       label: label,
       confidence: confidence,
@@ -107,68 +84,427 @@ class Detection {
       y1: bbox[1],
       x2: bbox[2],
       y2: bbox[3],
-      mask: mask,
     );
   }
 
-  static List<Detection> listFromResponse(Map<String, dynamic> response) {
-    final rawDetections = response['detections'] ??
-        response['results'] ??
-        response['data'] ??
-        response['predictions'] ??
-        [];
+  static List<Detection> listFromResponse(
+      Map<String, dynamic> response) {
+    final rawDetections =
+        response['detections'] ??
+            response['results'] ??
+            response['data'] ??
+            response['predictions'] ??
+            [];
 
-    if (rawDetections is! List) return [];
+    if (rawDetections is! List) {
+      return [];
+    }
 
     return rawDetections
         .whereType<Map>()
-        .map((item) => Detection.fromJson(Map<String, dynamic>.from(item)))
+        .map(
+          (item) => Detection.fromJson(
+        Map<String, dynamic>.from(item),
+      ),
+    )
         .toList();
   }
 
-  static int totalFromResponse(Map<String, dynamic> response) {
-    final rawTotal = response['total'];
+  // ============================================================
+  // CONTAR GRANOS SIN DUPLICAR
+  // ============================================================
+  //
+  // Varias detecciones pueden pertenecer al mismo grano.
+  //
+  // Ejemplo:
+  //
+  //  detección 1 -> cereza_seca
+  //  detección 2 -> grano_negro
+  //  detección 3 -> por_hongo
+  //
+  // Si las cajas se parecen o se solapan fuertemente,
+  // se consideran UN SOLO GRANO.
+  //
+  // IMPORTANTE:
+  // Esto NO elimina los defectos de las estadísticas.
+  // Solamente evita duplicar el número total de granos.
+  //
 
-    if (rawTotal is num) {
-      return rawTotal.toInt();
+  static int uniqueGrainsCount(
+      List<Detection> detections) {
+    final validDetections = detections
+        .where(
+          (detection) =>
+      detection.hasValidBox,
+    )
+        .toList();
+
+    if (validDetections.isEmpty) {
+      return 0;
     }
 
-    return listFromResponse(response).length;
+    // Aquí guardaremos una detección representante
+    // de cada grano.
+    final List<Detection> uniqueGrains = [];
+
+    for (final detection in validDetections) {
+      bool belongsToExistingGrain = false;
+
+      for (final existingGrain in uniqueGrains) {
+        if (_sameGrain(
+          detection,
+          existingGrain,
+        )) {
+          belongsToExistingGrain = true;
+          break;
+        }
+      }
+
+      // Si no pertenece a ningún grano existente,
+      // creamos un nuevo grano.
+      if (!belongsToExistingGrain) {
+        uniqueGrains.add(detection);
+      }
+    }
+
+    return uniqueGrains.length;
   }
 
-  static String predictedClassFromResponse(Map<String, dynamic> response) {
-    final rawClass = response['predicted_class'] ??
-        response['predictedClass'] ??
-        response['main_class'] ??
-        response['mainClass'];
+  // ============================================================
+  // DETERMINAR SI DOS DETECCIONES SON EL MISMO GRANO
+  // ============================================================
 
-    if (rawClass == null) return '';
+  static bool _sameGrain(
+      Detection a,
+      Detection b,
+      ) {
+    // Primero verificamos que ambas cajas sean válidas.
+    if (!a.hasValidBox ||
+        !b.hasValidBox) {
+      return false;
+    }
 
-    return _normalizeLabel(rawClass.toString());
+    // ----------------------------------------------------------
+    // 1. IoU
+    // ----------------------------------------------------------
+    //
+    // IoU = área de intersección / área de unión.
+    //
+    // Mientras más alto sea el valor, más parecidas son
+    // las cajas.
+    //
+    // 0.00 -> no se parecen
+    // 0.50 -> bastante solapamiento
+    // 1.00 -> cajas idénticas
+    //
+    final iou = _calculateIoU(a, b);
+
+    // Para detecciones del mismo grano permitimos un
+    // solapamiento moderado.
+    if (iou >= 0.35) {
+      return true;
+    }
+
+    // ----------------------------------------------------------
+    // 2. UNA CAJA DENTRO DE LA OTRA
+    // ----------------------------------------------------------
+    //
+    // En algunos casos el modelo puede detectar el mismo grano
+    // con una caja grande y otra más pequeña.
+    //
+    // En ese caso el IoU puede ser menor, aunque realmente
+    // se trate del mismo grano.
+    //
+
+    final containment =
+    _calculateContainment(a, b);
+
+    if (containment >= 0.65) {
+      return true;
+    }
+
+    // ----------------------------------------------------------
+    // 3. CENTRO DE LAS CAJAS
+    // ----------------------------------------------------------
+    //
+    // También comprobamos que los centros estén suficientemente
+    // cerca.
+    //
+    // Esto ayuda cuando las cajas son ligeramente diferentes.
+    //
+
+    final centerDistance =
+    _centerDistance(a, b);
+
+    final averageDiagonal =
+        (_diagonal(a) + _diagonal(b)) / 2;
+
+    if (averageDiagonal > 0) {
+      final relativeDistance =
+          centerDistance / averageDiagonal;
+
+      // Si los centros están bastante cerca,
+      // consideramos que representan el mismo grano.
+      if (relativeDistance <= 0.30) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
-  static String _parseLabel(Map<String, dynamic> json) {
-    final dynamic rawLabel = json['class'] ??
-        json['label'] ??
-        json['name'] ??
-        json['class_name'] ??
-        json['defect'] ??
-        json['cls_name'];
+  // ============================================================
+  // CALCULAR IoU
+  // ============================================================
+
+  static double _calculateIoU(
+      Detection a,
+      Detection b) {
+    final intersectionLeft =
+    _max(a.x1, b.x1);
+
+    final intersectionTop =
+    _max(a.y1, b.y1);
+
+    final intersectionRight =
+    _min(a.x2, b.x2);
+
+    final intersectionBottom =
+    _min(a.y2, b.y2);
+
+    final intersectionWidth =
+        intersectionRight -
+            intersectionLeft;
+
+    final intersectionHeight =
+        intersectionBottom -
+            intersectionTop;
+
+    // No existe intersección.
+    if (intersectionWidth <= 0 ||
+        intersectionHeight <= 0) {
+      return 0.0;
+    }
+
+    final intersectionArea =
+        intersectionWidth *
+            intersectionHeight;
+
+    final areaA =
+        (a.x2 - a.x1) *
+            (a.y2 - a.y1);
+
+    final areaB =
+        (b.x2 - b.x1) *
+            (b.y2 - b.y1);
+
+    final unionArea =
+        areaA +
+            areaB -
+            intersectionArea;
+
+    if (unionArea <= 0) {
+      return 0.0;
+    }
+
+    return intersectionArea /
+        unionArea;
+  }
+
+  // ============================================================
+  // PORCENTAJE DE UNA CAJA QUE ESTÁ DENTRO DE LA OTRA
+  // ============================================================
+
+  static double _calculateContainment(
+      Detection a,
+      Detection b) {
+    final intersectionLeft =
+    _max(a.x1, b.x1);
+
+    final intersectionTop =
+    _max(a.y1, b.y1);
+
+    final intersectionRight =
+    _min(a.x2, b.x2);
+
+    final intersectionBottom =
+    _min(a.y2, b.y2);
+
+    final intersectionWidth =
+        intersectionRight -
+            intersectionLeft;
+
+    final intersectionHeight =
+        intersectionBottom -
+            intersectionTop;
+
+    if (intersectionWidth <= 0 ||
+        intersectionHeight <= 0) {
+      return 0.0;
+    }
+
+    final intersectionArea =
+        intersectionWidth *
+            intersectionHeight;
+
+    final areaA =
+        (a.x2 - a.x1) *
+            (a.y2 - a.y1);
+
+    final areaB =
+        (b.x2 - b.x1) *
+            (b.y2 - b.y1);
+
+    if (areaA <= 0 ||
+        areaB <= 0) {
+      return 0.0;
+    }
+
+    // Calculamos cuánto de la caja pequeña
+    // está dentro de la caja grande.
+    final smallerArea =
+    areaA < areaB
+        ? areaA
+        : areaB;
+
+    return intersectionArea /
+        smallerArea;
+  }
+
+  // ============================================================
+  // DISTANCIA ENTRE CENTROS
+  // ============================================================
+
+  static double _centerDistance(
+      Detection a,
+      Detection b) {
+    final centerAX =
+        (a.x1 + a.x2) / 2;
+
+    final centerAY =
+        (a.y1 + a.y2) / 2;
+
+    final centerBX =
+        (b.x1 + b.x2) / 2;
+
+    final centerBY =
+        (b.y1 + b.y2) / 2;
+
+    final dx =
+        centerAX - centerBX;
+
+    final dy =
+        centerAY - centerBY;
+
+    return _sqrt(
+      (dx * dx) +
+          (dy * dy),
+    );
+  }
+
+  // ============================================================
+  // DIAGONAL DE LA CAJA
+  // ============================================================
+
+  static double _diagonal(
+      Detection detection) {
+    final width =
+        detection.x2 -
+            detection.x1;
+
+    final height =
+        detection.y2 -
+            detection.y1;
+
+    return _sqrt(
+      (width * width) +
+          (height * height),
+    );
+  }
+
+  // ============================================================
+  // FUNCIONES MATEMÁTICAS
+  // ============================================================
+
+  static double _max(
+      double a,
+      double b) {
+    return a > b ? a : b;
+  }
+
+  static double _min(
+      double a,
+      double b) {
+    return a < b ? a : b;
+  }
+
+  static double _sqrt(
+      double value) {
+    // Método sencillo para no necesitar otro paquete.
+    if (value <= 0) {
+      return 0.0;
+    }
+
+    double result = value;
+
+    for (int i = 0; i < 10; i++) {
+      result =
+          0.5 *
+              (result +
+                  value / result);
+    }
+
+    return result;
+  }
+
+  // ============================================================
+  // TOTAL DE GRANOS
+  // ============================================================
+
+  static int totalFromResponse(
+      Map<String, dynamic> response) {
+    final detections =
+    listFromResponse(response);
+
+    return uniqueGrainsCount(
+      detections,
+    );
+  }
+
+  // ============================================================
+  // OBTENER CLASE
+  // ============================================================
+
+  static String _parseLabel(
+      Map<String, dynamic> json) {
+    final dynamic rawLabel =
+        json['class'] ??
+            json['label'] ??
+            json['name'] ??
+            json['class_name'] ??
+            json['defect'] ??
+            json['cls_name'];
 
     if (rawLabel != null) {
       if (rawLabel is num) {
-        final index = rawLabel.toInt();
+        final index =
+        rawLabel.toInt();
 
-        if (index >= 0 && index < classNames.length) {
+        if (index >= 0 &&
+            index < classNames.length) {
           return classNames[index];
         }
       }
 
-      final text = rawLabel.toString().trim();
+      final text =
+      rawLabel.toString().trim();
 
-      final index = int.tryParse(text);
+      final index =
+      int.tryParse(text);
 
-      if (index != null && index >= 0 && index < classNames.length) {
+      if (index != null &&
+          index >= 0 &&
+          index < classNames.length) {
         return classNames[index];
       }
 
@@ -177,35 +513,21 @@ class Detection {
       }
     }
 
-    final dynamic rawClassId = json['class_id'] ??
-        json['cls'] ??
-        json['category_id'] ??
-        json['id'];
-
-    if (rawClassId != null) {
-      if (rawClassId is num) {
-        final index = rawClassId.toInt();
-
-        if (index >= 0 && index < classNames.length) {
-          return classNames[index];
-        }
-      }
-
-      final index = int.tryParse(rawClassId.toString());
-
-      if (index != null && index >= 0 && index < classNames.length) {
-        return classNames[index];
-      }
-    }
-
     return 'desconocido';
   }
 
-  static String _normalizeLabel(String value) {
-    final text = value.trim().toLowerCase();
+  // ============================================================
+  // NORMALIZAR CLASE
+  // ============================================================
+
+  static String _normalizeLabel(
+      String value) {
+    final text =
+    value.trim().toLowerCase();
 
     for (final className in classNames) {
-      if (text == className.toLowerCase()) {
+      if (text ==
+          className.toLowerCase()) {
         return className;
       }
     }
@@ -213,28 +535,78 @@ class Detection {
     return text;
   }
 
-  static List<double> _parseBbox(dynamic value) {
-    if (value is Map) {
-      final x1 = _toDouble(value['x1'] ?? value['xmin'] ?? value['left']);
-      final y1 = _toDouble(value['y1'] ?? value['ymin'] ?? value['top']);
-      final x2 = _toDouble(value['x2'] ?? value['xmax'] ?? value['right']);
-      final y2 = _toDouble(value['y2'] ?? value['ymax'] ?? value['bottom']);
+  // ============================================================
+  // OBTENER BOUNDING BOX
+  // ============================================================
 
-      if (x2 > x1 && y2 > y1) {
-        return [x1, y1, x2, y2];
+  static List<double> _parseBbox(
+      dynamic value) {
+    if (value is Map) {
+      final x1 = _toDouble(
+        value['x1'] ??
+            value['xmin'] ??
+            value['left'],
+      );
+
+      final y1 = _toDouble(
+        value['y1'] ??
+            value['ymin'] ??
+            value['top'],
+      );
+
+      final x2 = _toDouble(
+        value['x2'] ??
+            value['xmax'] ??
+            value['right'],
+      );
+
+      final y2 = _toDouble(
+        value['y2'] ??
+            value['ymax'] ??
+            value['bottom'],
+      );
+
+      if (x2 > x1 &&
+          y2 > y1) {
+        return [
+          x1,
+          y1,
+          x2,
+          y2,
+        ];
       }
 
-      final x = _toDouble(value['x']);
-      final y = _toDouble(value['y']);
-      final width = _toDouble(value['width'] ?? value['w']);
-      final height = _toDouble(value['height'] ?? value['h']);
+      final x =
+      _toDouble(value['x']);
 
-      if (width > 0 && height > 0) {
-        return [x, y, x + width, y + height];
+      final y =
+      _toDouble(value['y']);
+
+      final width =
+      _toDouble(
+        value['width'] ??
+            value['w'],
+      );
+
+      final height =
+      _toDouble(
+        value['height'] ??
+            value['h'],
+      );
+
+      if (width > 0 &&
+          height > 0) {
+        return [
+          x,
+          y,
+          x + width,
+          y + height,
+        ];
       }
     }
 
-    if (value is List && value.length >= 4) {
+    if (value is List &&
+        value.length >= 4) {
       return [
         _toDouble(value[0]),
         _toDouble(value[1]),
@@ -243,130 +615,93 @@ class Detection {
       ];
     }
 
-    return [0, 0, 0, 0];
+    return [
+      0,
+      0,
+      0,
+      0,
+    ];
   }
 
-  static List<Offset> _parseMask(dynamic value) {
-    if (value == null) return [];
+  // ============================================================
+  // CONVERTIR A DOUBLE
+  // ============================================================
 
-    if (value is Map) {
-      if (value.containsKey('x') && value.containsKey('y')) {
-        return [
-          Offset(
-            _toDouble(value['x']),
-            _toDouble(value['y']),
-          ),
-        ];
-      }
-
-      final inner = value['points'] ??
-          value['mask'] ??
-          value['polygon'] ??
-          value['segmentation'];
-
-      if (inner != null) {
-        return _parseMask(inner);
-      }
-
-      return [];
+  static double _toDouble(
+      dynamic value) {
+    if (value == null) {
+      return 0.0;
     }
 
-    if (value is! List || value.isEmpty) return [];
-
-    if (value.first is Map) {
-      final points = <Offset>[];
-
-      for (final item in value) {
-        if (item is Map && item.containsKey('x') && item.containsKey('y')) {
-          points.add(
-            Offset(
-              _toDouble(item['x']),
-              _toDouble(item['y']),
-            ),
-          );
-        }
-      }
-
-      return points;
+    if (value is num) {
+      return value.toDouble();
     }
 
-    if (value.first is num) {
-      final points = <Offset>[];
-
-      for (int i = 0; i + 1 < value.length; i += 2) {
-        points.add(
-          Offset(
-            _toDouble(value[i]),
-            _toDouble(value[i + 1]),
-          ),
-        );
-      }
-
-      return points;
-    }
-
-    if (value.first is List) {
-      final first = value.first;
-
-      if (first is List && first.length >= 2 && first.first is num) {
-        final points = <Offset>[];
-
-        for (final point in value) {
-          if (point is List && point.length >= 2) {
-            points.add(
-              Offset(
-                _toDouble(point[0]),
-                _toDouble(point[1]),
-              ),
-            );
-          }
-        }
-
-        return points;
-      }
-
-      for (final item in value) {
-        final parsed = _parseMask(item);
-
-        if (parsed.length >= 3) {
-          return parsed;
-        }
-      }
-    }
-
-    return [];
+    return double.tryParse(
+      value.toString(),
+    ) ??
+        0.0;
   }
 
-  static double _toDouble(dynamic value) {
-    if (value == null) return 0.0;
-    if (value is num) return value.toDouble();
-    return double.tryParse(value.toString()) ?? 0.0;
-  }
+  // ============================================================
+  // COLOR DE CADA DEFECTO
+  // ============================================================
 
-  static Color colorForLabel(String label) {
-    final cleanLabel = _normalizeLabel(label);
+  static Color colorForLabel(
+      String label) {
+    final cleanLabel =
+    _normalizeLabel(label);
 
     switch (cleanLabel) {
       case 'agrio_parcial':
-        return const Color(0xFFFFB300);
+        return const Color(
+          0xFFFFB300,
+        );
+
       case 'broca_leve_severa':
-        return const Color(0xFF795548);
+        return const Color(
+          0xFF795548,
+        );
+
       case 'cereza_seca':
-        return const Color(0xFFE65100);
+        return const Color(
+          0xFFE65100,
+        );
+
       case 'concha':
-        return const Color(0xFF8E24AA);
+        return const Color(
+          0xFF8E24AA,
+        );
+
       case 'cortado':
-        return const Color(0xFFE53935);
+        return const Color(
+          0xFFE53935,
+        );
+
       case 'grano_negro':
-        return const Color(0xFF212121);
+        return const Color(
+          0xFF212121,
+        );
+
       case 'negro_parcial':
-        return const Color(0xFF546E7A);
+        return const Color(
+          0xFF546E7A,
+        );
+
       case 'normal':
-        return const Color(0xFF43A047);
+        return const Color(
+          0xFF43A047,
+        );
+
       case 'por_hongo':
-        return const Color(0xFF00897B);
+        return const Color(
+          0xFF00897B,
+        );
+
       default:
-        return const Color(0xFF1E88E5);
+        return const Color(
+          0xFF1E88E5,
+        );
     }
   }
 }
